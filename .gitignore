@@ -1,0 +1,7 @@
+*.ex4
+*.log
+*.csv
+*.html
+*.set
+.DS_Store
+Thumbs.db

@@ -84,4 +84,4 @@ A robust Expert Advisor for MT4 that combines RSI, Moving Average, and ADX indic
 
 ## License
 
-MIT# rsi-ma-combo-ea
+MIT
