@@ -1,0 +1,361 @@
+//+------------------------------------------------------------------+
+//|         RSI+MA Combo EA (MT5) - Final Build (Optimized & Safe)   |
+//+------------------------------------------------------------------+
+#property script_show_inputs
+
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+//---- Inputs
+input double LotSize           = 0.01;
+input int    RSI_Period        = 14;
+input int    RSI_Buy_Level     = 30;
+input int    RSI_Sell_Level    = 70;
+input int    MA_Period         = 25;
+input int    StopLossPips      = 20;
+input int    TakeProfitPips    = 40;
+
+input bool   UseTrailingStop   = true;
+input int    TrailingStart     = 5;
+input int    TrailingStep      = 2;
+
+input bool   UseBreakEven      = true;
+input int    BreakEvenTrigger  = 8;
+input int    BreakEvenOffset   = 1;
+
+input bool   UseTimeFilter     = true;
+input int    TradeStartHour    = 8;
+input int    TradeEndHour      = 18;
+
+input bool   UseADXFilter      = true;
+input int    ADX_Period        = 14;
+input int    ADX_Minimum       = 20;
+
+input bool   UseDailyLimit     = true;
+input double DailyProfitTarget = 10.0;
+input double DailyLossLimit    = 10.0;
+input int    PauseDurationHours= 4;
+
+input bool   UseDynamicExit    = true;
+input int    ConfirmBars       = 2;
+input double ADXExitThreshold  = 20.0;
+
+input ulong  MagicNumber       = 12345;
+
+//---- Globals
+datetime pausedUntil = 0;
+int pauseReason = 0; // 0 = none, 1 = profit, 2 = loss
+string labelName = "EA_Status_Label";
+datetime lastTradeBarTime = 0;
+
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   CreateOrUpdateLabel("⚪ Trading active - All systems running.", clrWhite);
+   Print("RSI+MA Combo EA (MT5) vFinal initialized.");
+   return(INIT_SUCCEEDED);
+  }
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+   ObjectDelete(0,labelName);
+  }
+//+------------------------------------------------------------------+
+void OnTick()
+  {
+   MqlTick tick;
+   SymbolInfoTick(_Symbol,tick);
+   double Bid = tick.bid, Ask = tick.ask;
+
+   // Daily pause logic
+   if(UseDailyLimit)
+     {
+      double todayPL = GetTodayClosedProfit();
+      if(pausedUntil <= TimeCurrent())
+        {
+         if(todayPL >= DailyProfitTarget && DailyProfitTarget > 0)
+           {
+            pausedUntil = TimeCurrent() + PauseDurationHours * 3600;
+            pauseReason = 1;
+            CreateOrUpdateLabel("🟢 Trading paused - Daily Profit Target Hit! ⏰ Resumes at: " + TimeToString(pausedUntil,TIME_MINUTES), clrGreen);
+           }
+         else if(todayPL <= -MathAbs(DailyLossLimit) && DailyLossLimit > 0)
+           {
+            pausedUntil = TimeCurrent() + PauseDurationHours * 3600;
+            pauseReason = 2;
+            CreateOrUpdateLabel("🔴 Trading paused - Daily Loss Limit Reached! ⏰ Resumes at: " + TimeToString(pausedUntil,TIME_MINUTES), clrRed);
+           }
+        }
+      else
+        {
+         if(pausedUntil > TimeCurrent())
+           {
+            CreateOrUpdateLabel((pauseReason==1?"🟢 Trading paused - Daily Profit Target Hit!":"🔴 Trading paused - Daily Loss Limit Reached!") + " ⏰ Resumes at: " + TimeToString(pausedUntil,TIME_MINUTES), (pauseReason==1?clrGreen:clrRed));
+            ManageTrade();
+            return;
+           }
+         else
+           {
+            pausedUntil = 0;
+            pauseReason = 0;
+            CreateOrUpdateLabel("⚪ Trading active - All systems running.", clrWhite);
+           }
+        }
+     }
+
+   // Time Filter
+   if(UseTimeFilter)
+     {
+      int currentHour = TimeHour(TimeCurrent());
+      if(currentHour < TradeStartHour || currentHour >= TradeEndHour)
+        {
+         ManageTrade();
+         return;
+        }
+     }
+
+   // manage open trades first
+   if(CountOpenOrders() > 0)
+     {
+      ManageTrade();
+      return;
+     }
+
+   // only trade once per bar
+   if(lastTradeBarTime == iTime(_Symbol,PERIOD_CURRENT,0)) return;
+
+   // --- Indicator handles ---
+   double rsi = iRSI(_Symbol,PERIOD_CURRENT,RSI_Period,PRICE_CLOSE,0);
+   double ma  = iMA(_Symbol,PERIOD_CURRENT,MA_Period,0,MODE_SMA,PRICE_CLOSE,0);
+   double adx = iADX(_Symbol,PERIOD_CURRENT,ADX_Period,PRICE_CLOSE,MODE_MAIN,0);
+   double plusDI = iADX(_Symbol,PERIOD_CURRENT,ADX_Period,PRICE_CLOSE,MODE_PLUSDI,0);
+   double minusDI = iADX(_Symbol,PERIOD_CURRENT,ADX_Period,PRICE_CLOSE,MODE_MINUSDI,0);
+   double price = Bid;
+
+   // ADX Filter (strength & direction)
+   if(UseADXFilter && adx < ADX_Minimum) return;
+
+   // Prevent duplicate entries per bar
+   if(IsTradingPaused()) return;
+
+   // Buy condition
+   if(rsi <= RSI_Buy_Level && price > ma && plusDI > minusDI)
+     {
+      if(!HasOpenOrder(POSITION_TYPE_BUY))
+        {
+         if(OpenTrade(POSITION_TYPE_BUY)) lastTradeBarTime = iTime(_Symbol,PERIOD_CURRENT,0);
+        }
+     }
+
+   // Sell condition
+   if(rsi >= RSI_Sell_Level && price < ma && minusDI > plusDI)
+     {
+      if(!HasOpenOrder(POSITION_TYPE_SELL))
+        {
+         if(OpenTrade(POSITION_TYPE_SELL)) lastTradeBarTime = iTime(_Symbol,PERIOD_CURRENT,0);
+        }
+     }
+  }
+//+------------------------------------------------------------------+
+bool IsTradingPaused()
+  {
+   if(!UseDailyLimit) return(false);
+   if(pausedUntil == 0) return(false);
+   return(pausedUntil > TimeCurrent());
+  }
+//+------------------------------------------------------------------+
+// Returns true if trade opened successfully
+bool OpenTrade(int type)
+  {
+   double sl,tp,price;
+   double point = SymbolInfoDouble(_Symbol,SYMBOL_POINT);
+   int digits = (int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
+   double pip = (digits==3 || digits==5) ? point*10 : point;
+
+   // Broker stop level check
+   double stopLevel = SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL) * pip;
+   if(StopLossPips * pip < stopLevel) { Print("SL too close to market. Adjust your StopLossPips."); return(false); }
+   if(TakeProfitPips * pip < stopLevel) { Print("TP too close to market. Adjust your TakeProfitPips."); return(false); }
+
+   ENUM_ORDER_TYPE orderType = (type==POSITION_TYPE_BUY) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   double ask = SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol,SYMBOL_BID);
+
+   if(orderType==ORDER_TYPE_BUY)
+     {
+      price = ask;
+      sl = price - StopLossPips * pip;
+      tp = price + TakeProfitPips * pip;
+     }
+   else
+     {
+      price = bid;
+      sl = price + StopLossPips * pip;
+      tp = price - TakeProfitPips * pip;
+     }
+
+   bool result = trade.PositionOpen(_Symbol,orderType,LotSize,price,sl,tp,"RSI_MA_Trade",MagicNumber);
+   if(result) Print("Order opened.");
+   else Print("Order failed: ", trade.ResultRetcode());
+   return result;
+  }
+//+------------------------------------------------------------------+
+// Count open orders for this EA
+int CountOpenOrders()
+  {
+   int count = 0;
+   for(int i=0; i<PositionsTotal(); i++)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket))
+         if(PositionGetString(POSITION_SYMBOL)==_Symbol && PositionGetInteger(POSITION_MAGIC)==MagicNumber)
+            count++;
+     }
+   return count;
+  }
+//+------------------------------------------------------------------+
+// Returns true if an order of the given type exists
+bool HasOpenOrder(int type)
+  {
+   for(int i=0; i<PositionsTotal(); i++)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket))
+        {
+         if(PositionGetString(POSITION_SYMBOL)==_Symbol && PositionGetInteger(POSITION_MAGIC)==MagicNumber && PositionGetInteger(POSITION_TYPE)==type)
+            return true;
+        }
+     }
+   return false;
+  }
+//+------------------------------------------------------------------+
+void ManageTrade()
+  {
+   double point = SymbolInfoDouble(_Symbol,SYMBOL_POINT);
+   int digits = (int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
+   double pip = (digits==3 || digits==5) ? point*10 : point;
+   double stopLevel = SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL) * pip;
+
+   for(int i=0; i<PositionsTotal(); i++)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL)!=_Symbol || PositionGetInteger(POSITION_MAGIC)!=MagicNumber) continue;
+      int posType = PositionGetInteger(POSITION_TYPE);
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl = PositionGetDouble(POSITION_SL);
+      double tp = PositionGetDouble(POSITION_TP);
+      double lots = PositionGetDouble(POSITION_VOLUME);
+
+      double profitPips = (posType==POSITION_TYPE_BUY) ? (SymbolInfoDouble(_Symbol,SYMBOL_BID)-openPrice)/pip : (openPrice-SymbolInfoDouble(_Symbol,SYMBOL_ASK))/pip;
+      double newSL;
+
+      // Break-even
+      if(UseBreakEven && profitPips >= BreakEvenTrigger)
+        {
+         if(posType==POSITION_TYPE_BUY && sl < openPrice)
+           {
+            newSL = openPrice + BreakEvenOffset * pip;
+            if((openPrice-newSL) >= stopLevel)
+               trade.PositionModify(ticket,newSL,tp);
+           }
+         else if(posType==POSITION_TYPE_SELL && (sl > openPrice || sl==0))
+           {
+            newSL = openPrice - BreakEvenOffset * pip;
+            if((newSL-openPrice) >= stopLevel)
+               trade.PositionModify(ticket,newSL,tp);
+           }
+        }
+
+      // Trailing stop
+      if(UseTrailingStop && profitPips >= TrailingStart)
+        {
+         if(posType==POSITION_TYPE_BUY)
+           {
+            newSL = SymbolInfoDouble(_Symbol,SYMBOL_BID) - TrailingStep * pip;
+            if(newSL > sl && (SymbolInfoDouble(_Symbol,SYMBOL_BID)-newSL) >= stopLevel)
+               trade.PositionModify(ticket,newSL,tp);
+           }
+         else if(posType==POSITION_TYPE_SELL)
+           {
+            newSL = SymbolInfoDouble(_Symbol,SYMBOL_ASK) + TrailingStep * pip;
+            if((sl==0 || newSL<sl) && (newSL-SymbolInfoDouble(_Symbol,SYMBOL_ASK)) >= stopLevel)
+               trade.PositionModify(ticket,newSL,tp);
+           }
+        }
+
+      // Dynamic Exit
+      if(UseDynamicExit)
+        {
+         double adx_now = iADX(_Symbol,PERIOD_CURRENT,ADX_Period,PRICE_CLOSE,MODE_MAIN,0);
+         if(adx_now >= ADXExitThreshold)
+           {
+            int confirmCount = 0;
+            for(int b=0; b<ConfirmBars; b++)
+              {
+               double rsi_b = iRSI(_Symbol,PERIOD_CURRENT,RSI_Period,PRICE_CLOSE,b);
+               double ma_b  = iMA(_Symbol,PERIOD_CURRENT,MA_Period,0,MODE_SMA,PRICE_CLOSE,b);
+               double plusDI_b = iADX(_Symbol,PERIOD_CURRENT,ADX_Period,PRICE_CLOSE,MODE_PLUSDI,b);
+               double minusDI_b = iADX(_Symbol,PERIOD_CURRENT,ADX_Period,PRICE_CLOSE,MODE_MINUSDI,b);
+
+               if(posType==POSITION_TYPE_BUY)
+                 {
+                  bool sellSignal = (rsi_b >= RSI_Sell_Level && iClose(_Symbol,PERIOD_CURRENT,b) < ma_b && minusDI_b > plusDI_b);
+                  if(sellSignal) confirmCount++;
+                 }
+               else if(posType==POSITION_TYPE_SELL)
+                 {
+                  bool buySignal = (rsi_b <= RSI_Buy_Level && iClose(_Symbol,PERIOD_CURRENT,b) > ma_b && plusDI_b > minusDI_b);
+                  if(buySignal) confirmCount++;
+                 }
+              }
+            if(confirmCount >= ConfirmBars)
+              {
+               bool closed = false;
+               if(posType==POSITION_TYPE_BUY)
+                  closed = trade.PositionClose(ticket);
+               else if(posType==POSITION_TYPE_SELL)
+                  closed = trade.PositionClose(ticket);
+               if(closed)
+                  Print("Dynamic Exit: Closed ", (posType==POSITION_TYPE_BUY ? "BUY" : "SELL"), " #", ticket, " after ", ConfirmBars, " confirming bars (ADX=", DoubleToString(adx_now,2), ")");
+               continue;
+              }
+           }
+        }
+     }
+  }
+//+------------------------------------------------------------------+
+// Calculate today's closed trades profit (in account currency)
+double GetTodayClosedProfit()
+  {
+   double sum = 0.0;
+   for(int i=0; i<HistoryDealsTotal(); i++)
+     {
+      ulong deal_ticket = HistoryDealGetTicket(i);
+      if(!HistoryDealSelect(deal_ticket)) continue;
+      if((ulong)HistoryDealGetInteger(deal_ticket,DEAL_MAGIC) != MagicNumber) continue;
+      datetime ct = (datetime)HistoryDealGetInteger(deal_ticket,DEAL_TIME);
+      if(ct==0) continue;
+      if(TimeDay(ct) == TimeDay(TimeCurrent()) &&
+         TimeMonth(ct) == TimeMonth(TimeCurrent()) &&
+         TimeYear(ct) == TimeYear(TimeCurrent()))
+         sum += HistoryDealGetDouble(deal_ticket,DEAL_PROFIT) + HistoryDealGetDouble(deal_ticket,DEAL_SWAP) + HistoryDealGetDouble(deal_ticket,DEAL_COMMISSION);
+     }
+   return(sum);
+  }
+//+------------------------------------------------------------------+
+// Create or update on-chart label with color
+void CreateOrUpdateLabel(string text, color clr)
+  {
+   if(ObjectFind(0,labelName) < 0)
+     {
+      ObjectCreate(0,labelName,OBJ_LABEL,0,0,0);
+      ObjectSetInteger(0,labelName,OBJPROP_CORNER,CORNER_RIGHT_UPPER);
+      ObjectSetInteger(0,labelName,OBJPROP_XDISTANCE,20);
+      ObjectSetInteger(0,labelName,OBJPROP_YDISTANCE,20);
+      ObjectSetInteger(0,labelName,OBJPROP_FONTSIZE,10);
+     }
+   ObjectSetString(0,labelName,OBJPROP_TEXT,text);
+   ObjectSetInteger(0,labelName,OBJPROP_COLOR,clr);
+  }
+//+------------------------------------------------------------------+
